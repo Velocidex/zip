@@ -11,7 +11,10 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"io/ioutil"
+	"os"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -22,9 +25,10 @@ var (
 
 // Writer implements a zip file writer.
 type Writer struct {
+	sync.Mutex
+
 	cw          *countWriter
 	dir         []*header
-	last        *fileWriter
 	closed      bool
 	compressors map[uint16]Compressor
 	comment     string
@@ -74,12 +78,6 @@ func (w *Writer) SetComment(comment string) error {
 // Close finishes writing the zip file by writing the central directory.
 // It does not close the underlying writer.
 func (w *Writer) Close() error {
-	if w.last != nil && !w.last.closed {
-		if err := w.last.close(); err != nil {
-			return err
-		}
-		w.last = nil
-	}
 	if w.closed {
 		return errors.New("zip: writer closed twice")
 	}
@@ -214,7 +212,7 @@ func (w *Writer) Close() error {
 // slash to the name.
 // The file's contents must be written to the io.Writer before the next
 // call to Create, CreateHeader, or Close.
-func (w *Writer) Create(name string) (io.Writer, error) {
+func (w *Writer) Create(name string) (io.WriteCloser, error) {
 	header := &FileHeader{
 		Name:   name,
 		Method: Deflate,
@@ -252,12 +250,7 @@ func detectUTF8(s string) (valid, require bool) {
 // This returns a Writer to which the file contents should be written.
 // The file's contents must be written to the io.Writer before the next
 // call to Create, CreateHeader, or Close.
-func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
-	if w.last != nil && !w.last.closed {
-		if err := w.last.close(); err != nil {
-			return nil, err
-		}
-	}
+func (w *Writer) CreateHeader(fh *FileHeader) (io.WriteCloser, error) {
 	if len(w.dir) > 0 && w.dir[len(w.dir)-1].FileHeader == fh {
 		// See https://golang.org/issue/11144 confusion.
 		return nil, errors.New("archive/zip: invalid duplicate FileHeader")
@@ -320,12 +313,12 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 	}
 
 	var (
-		ow io.Writer
+		ow io.WriteCloser
 		fw *fileWriter
 	)
 	h := &header{
 		FileHeader: fh,
-		offset:     uint64(w.cw.count),
+		// offset:     uint64(w.cw.count),
 	}
 
 	if strings.HasSuffix(fh.Name, "/") {
@@ -342,20 +335,30 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 		fh.UncompressedSize = 0
 		fh.UncompressedSize64 = 0
 
-		ow = dirWriter{}
+		ow = &dirWriter{h: h, zip: w}
 	} else {
 		fh.Flags |= 0x8 // we will write a data descriptor
 
+		tmpfile, err := ioutil.TempFile("", "tmp")
+		if err != nil {
+			return nil, err
+		}
+
 		fw = &fileWriter{
-			zipw:      w.cw,
-			compCount: &countWriter{w: w.cw},
+			compCount: &countWriter{w: tmpfile},
 			crc32:     crc32.NewIEEE(),
+
+			tmp_file:     tmpfile,
+			tmp_filename: tmpfile.Name(),
+			header:       h,
+
+			// Owner
+			zip: w,
 		}
 		comp := w.compressor(fh.Method)
 		if comp == nil {
 			return nil, ErrAlgorithm
 		}
-		var err error
 		fw.comp, err = comp(fw.compCount)
 		if err != nil {
 			return nil, err
@@ -364,12 +367,6 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 		fw.header = h
 		ow = fw
 	}
-	w.dir = append(w.dir, h)
-	if err := writeHeader(w.cw, fh); err != nil {
-		return nil, err
-	}
-	// If we're creating a directory, fw is nil.
-	w.last = fw
 	return ow, nil
 }
 
@@ -423,23 +420,40 @@ func (w *Writer) compressor(method uint16) Compressor {
 	return comp
 }
 
-type dirWriter struct{}
+type dirWriter struct {
+	h   *header
+	zip *Writer
+}
 
-func (dirWriter) Write(b []byte) (int, error) {
+func (self dirWriter) Write(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
 	return 0, errors.New("zip: write to directory")
 }
 
+func (self *dirWriter) Close() error {
+	self.zip.dir = append(self.zip.dir, self.h)
+	if err := writeHeader(self.zip.cw, self.h.FileHeader); err != nil {
+		return err
+	}
+	return nil
+}
+
 type fileWriter struct {
 	*header
-	zipw      io.Writer
 	rawCount  *countWriter
 	comp      io.WriteCloser
 	compCount *countWriter
 	crc32     hash.Hash32
 	closed    bool
+
+	tmp_file     io.WriteCloser
+	tmp_filename string
+	fh           *FileHeader
+
+	// Owner container - must hold lock to access.
+	zip *Writer
 }
 
 func (w *fileWriter) Write(p []byte) (int, error) {
@@ -450,14 +464,21 @@ func (w *fileWriter) Write(p []byte) (int, error) {
 	return w.rawCount.Write(p)
 }
 
-func (w *fileWriter) close() error {
+func (w *fileWriter) Close() error {
 	if w.closed {
 		return errors.New("zip: file closed twice")
 	}
 	w.closed = true
+
+	// Flush the compressor
 	if err := w.comp.Close(); err != nil {
 		return err
 	}
+
+	// Close the file and remove it when done. We will reopen it
+	// for copying.
+	w.tmp_file.Close()
+	defer os.Remove(w.tmp_filename)
 
 	// update FileHeader
 	fh := w.header.FileHeader
@@ -472,6 +493,32 @@ func (w *fileWriter) close() error {
 	} else {
 		fh.CompressedSize = uint32(fh.CompressedSize64)
 		fh.UncompressedSize = uint32(fh.UncompressedSize64)
+	}
+
+	// From here below we hold a lock on the container so we can
+	// write on it.
+	w.zip.Lock()
+	defer w.zip.Unlock()
+
+	// Update the header
+	w.header.offset = uint64(w.zip.cw.count)
+
+	// Write the file header, followed by compressed data and data descriptor.
+	w.zip.dir = append(w.zip.dir, w.header)
+	if err := writeHeader(w.zip.cw, w.header.FileHeader); err != nil {
+		return err
+	}
+
+	// Copy the tempfile to the zip
+	fd, err := os.Open(w.tmp_filename)
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+
+	_, err = io.Copy(w.zip.cw, fd)
+	if err != nil {
+		return err
 	}
 
 	// Write data descriptor. This is more complicated than one would
@@ -495,7 +542,7 @@ func (w *fileWriter) close() error {
 		b.uint32(fh.CompressedSize)
 		b.uint32(fh.UncompressedSize)
 	}
-	_, err := w.zipw.Write(buf)
+	_, err = w.zip.cw.Write(buf)
 	return err
 }
 

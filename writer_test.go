@@ -6,6 +6,7 @@ package zip
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alecthomas/assert"
 )
 
 // TODO(adg): a more sophisticated test suite
@@ -204,6 +207,8 @@ func TestWriterUTF8(t *testing.T) {
 			t.Fatal(err)
 		}
 		w.Write([]byte{})
+
+		assert.NoError(t, w.Close())
 	}
 
 	if err := w.Close(); err != nil {
@@ -230,9 +235,12 @@ func TestWriterTime(t *testing.T) {
 		Modified: time.Date(2017, 10, 31, 21, 11, 57, 0, timeZone(-7*time.Hour)),
 	}
 	w := NewWriter(&buf)
-	if _, err := w.CreateHeader(h); err != nil {
+	fd, err := w.CreateHeader(h)
+	if err != nil {
 		t.Fatalf("unexpected CreateHeader error: %v", err)
 	}
+	assert.NoError(t, fd.Close())
+
 	if err := w.Close(); err != nil {
 		t.Fatalf("unexpected Close error: %v", err)
 	}
@@ -285,10 +293,10 @@ func TestWriterOffset(t *testing.T) {
 func TestWriterFlush(t *testing.T) {
 	var buf bytes.Buffer
 	w := NewWriter(struct{ io.Writer }{&buf})
-	_, err := w.Create("foo")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fd, err := w.Create("foo")
+	assert.NoError(t, err)
+	assert.NoError(t, fd.Close())
+
 	if buf.Len() > 0 {
 		t.Fatalf("Unexpected %d bytes already in buffer", buf.Len())
 	}
@@ -312,19 +320,23 @@ func TestWriterDir(t *testing.T) {
 	if _, err := dw.Write([]byte("hello")); err == nil {
 		t.Error(`Write("hello") to directory: got nil error, want non-nil`)
 	}
+	assert.NoError(t, dw.Close())
 }
 
 func TestWriterDirAttributes(t *testing.T) {
 	var buf bytes.Buffer
 	w := NewWriter(&buf)
-	if _, err := w.CreateHeader(&FileHeader{
+	fd, err := w.CreateHeader(&FileHeader{
 		Name:               "dir/",
 		Method:             Deflate,
 		CompressedSize64:   1234,
 		UncompressedSize64: 5678,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	assert.NoError(t, fd.Close())
+
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -353,6 +365,52 @@ func TestWriterDirAttributes(t *testing.T) {
 	}
 }
 
+func TestMultiWriters(t *testing.T) {
+	tmpfile, err := ioutil.TempFile("", "tmp")
+	assert.NoError(t, err)
+
+	defer os.Remove(tmpfile.Name())
+
+	fmt.Printf("Made temp file %v\n", tmpfile.Name())
+	length := 1024 * 1024
+	buffer := make([]byte, 0, length)
+	for i := 0; i < length; i++ {
+		buffer = append(buffer, byte(i))
+	}
+
+	zip := NewWriter(tmpfile)
+
+	pool := NewCompressorPool(context.Background(), zip, 10)
+
+	for i := 0; i < 1000; i++ {
+		pool.Compress(&Request{
+			Reader: ioutil.NopCloser(bytes.NewBuffer(buffer)),
+			Name:   fmt.Sprintf("foo%v.bin", i),
+		})
+	}
+	pool.Close()
+
+	err = zip.Close()
+	assert.NoError(t, err)
+
+	read_zip, err := NewReader(tmpfile, zip.cw.count)
+	assert.NoError(t, err)
+
+	// All the files are there.
+	assert.Equal(t, 1000, len(read_zip.File))
+
+	for i, f := range read_zip.File {
+		if i < 100 || i > 110 {
+			continue
+		}
+		fd, err := f.Open()
+		assert.NoError(t, err)
+		b, err := ioutil.ReadAll(fd)
+		assert.NoError(t, err)
+		assert.Equal(t, buffer, b)
+	}
+}
+
 func testCreate(t *testing.T, w *Writer, wt *WriteTest) {
 	header := &FileHeader{
 		Name:   wt.Name,
@@ -366,9 +424,8 @@ func testCreate(t *testing.T, w *Writer, wt *WriteTest) {
 		t.Fatal(err)
 	}
 	_, err = f.Write(wt.Data)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
+	assert.NoError(t, f.Close())
 }
 
 func testReadFile(t *testing.T, f *File, wt *WriteTest) {
@@ -405,6 +462,7 @@ func BenchmarkCompressedZipGarbage(b *testing.B) {
 				Method: Deflate,
 			})
 			w.Write(bigBuf)
+			w.Close()
 		}
 		zw.Close()
 	}
