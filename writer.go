@@ -251,6 +251,9 @@ func detectUTF8(s string) (valid, require bool) {
 // The file's contents must be written to the io.Writer before the next
 // call to Create, CreateHeader, or Close.
 func (w *Writer) CreateHeader(fh *FileHeader) (io.WriteCloser, error) {
+	w.Lock()
+	defer w.Unlock()
+
 	if len(w.dir) > 0 && w.dir[len(w.dir)-1].FileHeader == fh {
 		// See https://golang.org/issue/11144 confusion.
 		return nil, errors.New("archive/zip: invalid duplicate FileHeader")
@@ -339,6 +342,8 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.WriteCloser, error) {
 	} else {
 		fh.Flags |= 0x8 // we will write a data descriptor
 
+		// Write the compressed data to a tempfile, then just
+		// copy it into the zip file when we Close().
 		tmpfile, err := ioutil.TempFile("", "tmp")
 		if err != nil {
 			return nil, err
@@ -352,7 +357,7 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.WriteCloser, error) {
 			tmp_filename: tmpfile.Name(),
 			header:       h,
 
-			// Owner
+			// Owner - must lock when we access it.
 			zip: w,
 		}
 		comp := w.compressor(fh.Method)
