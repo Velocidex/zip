@@ -11,7 +11,6 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 	"sync"
@@ -344,7 +343,7 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.WriteCloser, error) {
 
 		// Write the compressed data to a tempfile, then just
 		// copy it into the zip file when we Close().
-		tmpfile, err := ioutil.TempFile("", "tmp")
+		tmpfile, err := TmpfileFactory.TempFile()
 		if err != nil {
 			return nil, err
 		}
@@ -483,7 +482,7 @@ func (w *fileWriter) Close() error {
 	// Close the file and remove it when done. We will reopen it
 	// for copying.
 	w.tmp_file.Close()
-	defer os.Remove(w.tmp_filename)
+	defer TmpfileFactory.RemoveTempFile(w.tmp_filename)
 
 	// update FileHeader
 	fh := w.header.FileHeader
