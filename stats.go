@@ -13,7 +13,7 @@ type StatsWriter interface {
 func (self *fileWriter) GetStats() Stats {
 	return Stats{
 		Name:             self.header.Name,
-		TmpFile:          self.tmp_filename,
+		TmpFile:          self.tmp_file.Name(),
 		UncompressedSize: uint64(self.rawCount.count),
 		CompressedSize:   uint64(self.compCount.count),
 	}
