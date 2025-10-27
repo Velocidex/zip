@@ -11,7 +11,6 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
-	"os"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -338,6 +337,7 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.WriteCloser, error) {
 		fh.UncompressedSize64 = 0
 
 		ow = &dirWriter{h: h, zip: w}
+
 	} else {
 		fh.Flags |= 0x8 // we will write a data descriptor
 
@@ -352,9 +352,8 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.WriteCloser, error) {
 			compCount: &countWriter{w: tmpfile},
 			crc32:     crc32.NewIEEE(),
 
-			tmp_file:     tmpfile,
-			tmp_filename: tmpfile.Name(),
-			header:       h,
+			tmp_file: tmpfile,
+			header:   h,
 
 			// Owner - must lock when we access it.
 			zip: w,
@@ -437,6 +436,13 @@ func (self dirWriter) Write(b []byte) (int, error) {
 }
 
 func (self *dirWriter) Close() error {
+	// From here below we hold a lock on the container so we can
+	// write on it.
+	self.zip.Lock()
+	defer self.zip.Unlock()
+
+	self.h.offset = uint64(self.zip.cw.count)
+
 	self.zip.dir = append(self.zip.dir, self.h)
 	if err := writeHeader(self.zip.cw, self.h.FileHeader); err != nil {
 		return err
@@ -452,9 +458,8 @@ type fileWriter struct {
 	crc32     hash.Hash32
 	closed    bool
 
-	tmp_file     io.WriteCloser
-	tmp_filename string
-	fh           *FileHeader
+	tmp_file TempFile
+	fh       *FileHeader
 
 	// Owner container - must hold lock to access.
 	zip *Writer
@@ -478,11 +483,6 @@ func (w *fileWriter) Close() error {
 	if err := w.comp.Close(); err != nil {
 		return err
 	}
-
-	// Close the file and remove it when done. We will reopen it
-	// for copying.
-	w.tmp_file.Close()
-	defer TmpfileFactory.RemoveTempFile(w.tmp_filename)
 
 	// update FileHeader
 	fh := w.header.FileHeader
@@ -513,8 +513,11 @@ func (w *fileWriter) Close() error {
 		return err
 	}
 
+	// Remove the tempfile when we finish copying it
+	defer w.tmp_file.Remove()
+
 	// Copy the tempfile to the zip
-	fd, err := os.Open(w.tmp_filename)
+	fd, err := w.tmp_file.Open()
 	if err != nil {
 		return err
 	}
